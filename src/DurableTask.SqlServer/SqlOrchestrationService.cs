@@ -34,7 +34,8 @@ namespace DurableTask.SqlServer
 
         readonly SqlOrchestrationServiceSettings settings;
         readonly LogHelper traceHelper;
-        readonly SqlDbManager dbManager;
+        readonly SqlDbManager dbManager; 
+        readonly OrchestrationSessionManager orchestrationSessionManager;
         readonly string lockedByValue;
         readonly string userId;
 
@@ -43,6 +44,8 @@ namespace DurableTask.SqlServer
             this.settings = ValidateSettings(settings) ?? throw new ArgumentNullException(nameof(settings));
             this.traceHelper = new LogHelper(this.settings.LoggerFactory.CreateLogger("DurableTask.SqlServer"));
             this.dbManager = new SqlDbManager(this.settings, this.traceHelper);
+            this.orchestrationSessionManager = new OrchestrationSessionManager(
+                this.settings, this.traceHelper, this.orchestrationBackoffHelper);
             this.lockedByValue = $"{this.settings.AppName},{Process.GetCurrentProcess().Id}";
             this.userId = new SqlConnectionStringBuilder(this.settings.TaskHubConnectionString).UserID ?? string.Empty;
         }
@@ -118,189 +121,23 @@ namespace DurableTask.SqlServer
             Stopwatch stopwatch = Stopwatch.StartNew();
             do
             {
-                using SqlConnection connection = await this.GetAndOpenConnectionAsync(cancellationToken);
-                using SqlCommand command = this.GetSprocCommand(connection, $"{this.settings.SchemaName}._LockNextOrchestration");
-
-                int batchSize = this.settings.WorkItemBatchSize;
+                cancellationToken = cancellationToken == default ? this.ShutdownToken : cancellationToken;
                 DateTime lockExpiration = DateTime.UtcNow.Add(this.settings.WorkItemLockTimeout);
-
-                command.Parameters.Add("@BatchSize", SqlDbType.Int).Value = batchSize;
-                command.Parameters.Add("@LockedBy", SqlDbType.VarChar, 100).Value = this.lockedByValue;
-                command.Parameters.Add("@LockExpiration", SqlDbType.DateTime2).Value = lockExpiration;
-
-                DbDataReader reader;
-
-                try
+                var session =
+                    await this.orchestrationSessionManager.GetNextSessionAsync(lockExpiration, cancellationToken);
+                if (session != null)
                 {
-                    reader = await SqlUtils.ExecuteReaderAsync(
-                        command,
-                        this.traceHelper,
-                        instanceId: null,
-                        cancellationToken);
-                }
-                catch (Exception e)
-                {
-                    this.traceHelper.ProcessingError(e, new OrchestrationInstance());
-                    throw;
-                }
-
-                using (reader)
-                {
-                    // Result #1: The list of control queue messages
-                    int longestWaitTime = 0;
-                    var messages = new List<TaskMessage>(capacity: batchSize);
-                    var eventPayloadMappings = new EventPayloadMap(capacity: batchSize);
-                    while (await reader.ReadAsync(cancellationToken))
+                    return new TaskOrchestrationWorkItem
                     {
-                        TaskMessage message = reader.GetTaskMessage();
-                        messages.Add(message);
-                        Guid? payloadId = reader.GetPayloadId();
-                        if (payloadId.HasValue)
-                        {
-                            // TODO: Need to understand what the payload behavior is for retry events
-                            eventPayloadMappings.Add(message.Event, payloadId.Value);
-                        }
-
-                        // TODO: We're not currently using this value for anything. Ideally it would be included
-                        //       in some logging that still needs to be introduced.
-                        longestWaitTime = Math.Max(longestWaitTime, reader.GetInt32("WaitTime"));
-                    }
-
-                    if (messages.Count == 0)
-                    {
-                        if (!isWaiting)
-                        {
-                            this.traceHelper.GenericInfoEvent(
-                                "No events were found. Waiting for new events to appear.",
-                                instanceId: null);
-                            isWaiting = true;
-                        }
-
-                        // TODO: Make this dynamic based on the number of readers
-                        await this.orchestrationBackoffHelper.WaitAsync(cancellationToken);
-                        continue;
-                    }
-
-                    this.orchestrationBackoffHelper.Reset();
-                    isWaiting = false;
-
-                    // Result #2: The runtime status of the orchestration instance
-                    if (await reader.NextResultAsync(cancellationToken))
-                    {
-                        bool instanceExists = await reader.ReadAsync(cancellationToken);
-                        string instanceId;
-                        OrchestrationStatus? currentStatus;
-
-                        bool isRunning = false;
-                        if (instanceExists)
-                        {
-                            instanceId = SqlUtils.GetInstanceId(reader);
-                            currentStatus = SqlUtils.GetRuntimeStatus(reader);
-                            isRunning =
-                                currentStatus == OrchestrationStatus.Running ||
-                                currentStatus == OrchestrationStatus.Pending;
-                        }
-                        else
-                        {
-                            instanceId = messages.Select(msg => msg.OrchestrationInstance.InstanceId).First();
-                            currentStatus = null;
-                        }
-
-                        // If the instance is in a terminal state, log and discard the new events.
-                        // NOTE: In the future, we may want to allow processing of some events if, for example, they may
-                        //       change the state of a completed instance. For example, a rewind command.
-                        if (!isRunning)
-                        {
-                            string warningMessage = instanceExists ?
-                                $"Target is in the {currentStatus} state." :
-                                $"Target doesn't exist (either never existed or continued-as-new).";
-
-                            messages.ForEach(msg => this.traceHelper.DiscardingEvent(
-                                msg.OrchestrationInstance.InstanceId,
-                                msg.Event.EventType.ToString(),
-                                DTUtils.GetTaskEventId(msg.Event),
-                                warningMessage));
-
-                            // Close the already opened reader so that we can execute a new command
-                            reader.Close();
-
-                            // Delete the events and release the orchestration instance lock
-                            using SqlCommand discardCommand = this.GetSprocCommand(
-                                connection,
-                                $"{this.settings.SchemaName}._DiscardEventsAndUnlockInstance");
-                            discardCommand.Parameters.Add("@InstanceID", SqlDbType.VarChar, 100).Value = instanceId;
-                            discardCommand.Parameters.AddMessageIdParameter("@DeletedEvents", messages, this.settings.SchemaName);
-                            try
-                            {
-                                await SqlUtils.ExecuteNonQueryAsync(
-                                    discardCommand,
-                                    this.traceHelper,
-                                    instanceId,
-                                    cancellationToken);
-                            }
-                            catch (Exception e)
-                            {
-                                this.traceHelper.ProcessingError(e, new OrchestrationInstance { InstanceId = instanceId });
-                                throw;
-                            }
-
-                            continue;
-                        }
-                    }
-
-                    // Result #3: The full event history for the locked instance
-                    IList<HistoryEvent> history;
-                    if (await reader.NextResultAsync(cancellationToken))
-                    {
-                        history = await ReadHistoryEventsAsync(reader, executionIdFilter: null, cancellationToken);
-                    }
-                    else
-                    {
-                        this.traceHelper.GenericWarning(
-                            details: "Failed to read history from the database!",
-                            instanceId: messages.FirstOrDefault(m => m.OrchestrationInstance?.InstanceId != null)?.OrchestrationInstance.InstanceId);
-                        history = Array.Empty<HistoryEvent>();
-                    }
-
-                    var runtimeState = new OrchestrationRuntimeState(history);
-
-                    string orchestrationName;
-                    OrchestrationInstance instance;
-                    if (runtimeState.ExecutionStartedEvent != null)
-                    {
-                        // This is an existing instance
-                        orchestrationName = runtimeState.Name;
-                        instance = runtimeState.OrchestrationInstance!;
-                    }
-                    else if (messages[0].Event is ExecutionStartedEvent startedEvent)
-                    {
-                        // This is a new manually-created instance
-                        orchestrationName = startedEvent.Name;
-                        instance = startedEvent.OrchestrationInstance;
-                    }
-                    else if (Entities.AutoStart(messages[0].OrchestrationInstance.InstanceId, messages) &&
-                             messages[0].Event is ExecutionStartedEvent autoStartedEvent)
-                    {
-                        // This is a new auto-start instance (e.g. Durable Entities)
-                        orchestrationName = autoStartedEvent.Name;
-                        instance = autoStartedEvent.OrchestrationInstance;
-                    }
-                    else
-                    {
-                        // Don't know what to do with this message (TODO: Need to confirm behavior)
-                        orchestrationName = "(Unknown)";
-                        instance = new OrchestrationInstance();
-                    }
-
-                    return new ExtendedOrchestrationWorkItem(orchestrationName, instance, eventPayloadMappings)
-                    {
-                        InstanceId = messages[0].OrchestrationInstance.InstanceId,
+                        InstanceId = session.Instance.InstanceId,
                         LockedUntilUtc = lockExpiration,
-                        NewMessages = messages,
-                        OrchestrationRuntimeState = runtimeState,
+                        NewMessages = session.Messages,
+                        OrchestrationRuntimeState = session.RuntimeState,
+                        Session = this.settings.ExtendedSessionsEnabled ? session : null
                     };
                 }
-            } while (stopwatch.Elapsed < receiveTimeout);
+            }
+            while (stopwatch.Elapsed < receiveTimeout);
 
             return null;
         }
@@ -329,7 +166,14 @@ namespace DurableTask.SqlServer
             TaskMessage continuedAsNewMessage,
             OrchestrationState orchestrationState)
         {
-            ExtendedOrchestrationWorkItem currentWorkItem = (ExtendedOrchestrationWorkItem)workItem;
+            OrchestrationSession session;
+            if (!this.orchestrationSessionManager.TryGetExistingSession(workItem.InstanceId, out session))
+            {
+                this.traceHelper.GenericWarning(
+                    $"{nameof(CompleteTaskOrchestrationWorkItemAsync)}: Session for instance {workItem.InstanceId} was not found!",
+                    workItem.InstanceId);
+                return;
+            }
 
             this.traceHelper.CheckpointStarting(orchestrationState);
             Stopwatch sw = Stopwatch.StartNew();
@@ -347,8 +191,8 @@ namespace DurableTask.SqlServer
             command.Parameters.Add("@RuntimeStatus", SqlDbType.VarChar, size: 30).Value = orchestrationState.OrchestrationStatus.ToString();
             command.Parameters.Add("@CustomStatusPayload", SqlDbType.VarChar).Value = orchestrationState.Status ?? SqlString.Null;
 
-            currentWorkItem.EventPayloadMappings.Add(outboundMessages);
-            currentWorkItem.EventPayloadMappings.Add(orchestratorMessages);
+            session.EventPayloadMappings.Add(outboundMessages);
+            session.EventPayloadMappings.Add(orchestratorMessages);
 
             command.Parameters.AddMessageIdParameter("@DeletedEvents", workItem.NewMessages, this.settings.SchemaName);
 
@@ -357,13 +201,13 @@ namespace DurableTask.SqlServer
                 orchestratorMessages,
                 timerMessages,
                 continuedAsNewMessage,
-                currentWorkItem.EventPayloadMappings,
+                session.EventPayloadMappings,
                 this.settings.SchemaName);
 
             command.Parameters.AddTaskEventsParameter(
                 "@NewTaskEvents",
                 outboundMessages,
-                currentWorkItem.EventPayloadMappings,
+                session.EventPayloadMappings,
                 this.settings.SchemaName);
 
             command.Parameters.AddHistoryEventsParameter(
@@ -371,7 +215,7 @@ namespace DurableTask.SqlServer
                 newEvents,
                 instance,
                 nextSequenceNumber,
-                currentWorkItem.EventPayloadMappings,
+                session.EventPayloadMappings,
                 this.settings.SchemaName);
 
             try

@@ -65,7 +65,14 @@ namespace DurableTask.SqlServer.AzureFunctions
                 LoggerFactory = this.LoggerFactory,
                 WorkItemBatchSize = this.TaskEventBatchSize,
                 WorkItemLockTimeout = this.TaskEventLockTimeout,
+                ExtendedSessionsEnabled = extensionOptions.ExtendedSessionsEnabled
             };
+
+            if (extensionOptions.ExtendedSessionsEnabled)
+            {
+                settings.ExtendedSessionIdleTimeout =
+                    TimeSpan.FromSeconds(extensionOptions.ExtendedSessionIdleTimeoutInSeconds);
+            }
 
             if (extensionOptions.MaxConcurrentActivityFunctions.HasValue)
             {

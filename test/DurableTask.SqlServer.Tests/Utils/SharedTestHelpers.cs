@@ -33,7 +33,7 @@ namespace DurableTask.SqlServer.Tests.Utils
             var builder = new SqlConnectionStringBuilder(defaultConnectionString);
 
             // The use of SA_PASSWORD is intended for use with the mssql docker container
-            string saPassword = Environment.GetEnvironmentVariable("SA_PASSWORD");
+            string saPassword = "Durable123"; //Environment.GetEnvironmentVariable("SA_PASSWORD");
             if (!string.IsNullOrEmpty(saPassword))
             {
                 builder.IntegratedSecurity = false;
