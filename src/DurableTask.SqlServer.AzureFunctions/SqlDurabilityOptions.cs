@@ -77,6 +77,13 @@ namespace DurableTask.SqlServer.AzureFunctions
                 settings.MaxActiveOrchestrations = extensionOptions.MaxConcurrentOrchestratorFunctions.Value;
             }
 
+            if (extensionOptions.MaxConcurrentEntityFunctions.HasValue)
+            {
+                settings.MaxConcurrentTaskEntityWorkItems = extensionOptions.MaxConcurrentEntityFunctions.Value;
+            }
+
+            settings.MaxEntityOperationBatchSize = extensionOptions.MaxEntityOperationBatchSize;
+
             settings.ExtendedSessionsEnabled = extensionOptions.ExtendedSessionsEnabled;
             if (extensionOptions.ExtendedSessionIdleTimeoutInSeconds > 0)
             {

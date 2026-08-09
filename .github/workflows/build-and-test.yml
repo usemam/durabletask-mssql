@@ -10,6 +10,9 @@ on:
     paths-ignore: 
       - '**.md'
 
+permissions:
+  contents: read
+
 jobs:
   build:
 
@@ -18,26 +21,34 @@ jobs:
       SA_PASSWORD: NotASecret!12 # ([SuppressMessage\("Microsoft.Security", "CS001:SecretInline", Justification="This isn't a real prod secret, it is a local DB instance instantiated on demand."\)]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-    - name: Setup .NET 6
-      uses: actions/setup-dotnet@v3
+    - name: Setup .NET
+      uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
       with:
-        dotnet-version: '6.0.x'
-      env:
-        NUGET_AUTH_TOKEN: RequiredButNotUsed
+        dotnet-version: |
+          8.0.x
+          10.0.x
 
     - name: NuGet Restore
-      run: dotnet restore -v n
+      run: dotnet restore --configfile "$GITHUB_WORKSPACE/nuget.config" -v n
+
+    - name: Check vulnerable NuGet dependencies
+      run: |
+        output=$(dotnet list DurableTask.SqlServer.sln package --vulnerable --include-transitive --no-restore)
+        echo "$output"
+        if echo "$output" | grep --quiet "has the following vulnerable packages"; then
+          exit 1
+        fi
 
     - name: Build
-      run: dotnet build
+      run: dotnet build --no-restore
 
     - name: Setup SQL Server container
       run: test/setup.ps1
       shell: pwsh
 
     - name: Durable framework tests
-      run: dotnet test --no-build --verbosity normal --filter Category!=Stress ./test/DurableTask.SqlServer.Tests/DurableTask.SqlServer.Tests.csproj
+      run: dotnet test --no-build --verbosity normal --filter Category!=Stress -p:TestTfmsInParallel=false ./test/DurableTask.SqlServer.Tests/DurableTask.SqlServer.Tests.csproj
     - name: Functions runtime tests
-      run: dotnet test --no-build --verbosity normal ./test/DurableTask.SqlServer.AzureFunctions.Tests/DurableTask.SqlServer.AzureFunctions.Tests.csproj
+      run: dotnet test --no-build --verbosity normal -p:TestTfmsInParallel=false ./test/DurableTask.SqlServer.AzureFunctions.Tests/DurableTask.SqlServer.AzureFunctions.Tests.csproj
