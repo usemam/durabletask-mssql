@@ -88,6 +88,8 @@ namespace DurableTask.SqlServer
             return null;
         }
 
+        public Task EndSessionAsync() => Task.CompletedTask;
+
         public async Task ReleaseLockAsync()
         {
             try
