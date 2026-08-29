@@ -27,7 +27,6 @@ namespace DurableTask.SqlServer
 
         public SqlOrchestrationSession(
             SqlOrchestrationServiceSettings settings,
-            BackoffPollingHelper orchestrationBackoffHelper,
             LogHelper traceHelper,
             EventPayloadMap eventPayloadMappings,
             string instanceId,
@@ -35,7 +34,12 @@ namespace DurableTask.SqlServer
             CancellationToken shutdownToken)
         {
             this.settings = settings;
-            this.orchestrationBackoffHelper = orchestrationBackoffHelper;
+            // Each session owns an independent backoff helper so that its polling cadence is
+            // isolated from the main orchestration poller and from every other concurrent session.
+            this.orchestrationBackoffHelper = new BackoffPollingHelper(
+                settings.MinOrchestrationPollingInterval,
+                settings.MaxOrchestrationPollingInterval,
+                settings.DeltaBackoffOrchestrationPollingInterval);
             this.traceHelper = traceHelper;
             this.eventPayloadMappings = eventPayloadMappings;
             this.instanceId = instanceId;
@@ -66,6 +70,8 @@ namespace DurableTask.SqlServer
 
                 if (messages.Count > 0)
                 {
+                    // Reset the backoff so the next idle wait starts at the minimum interval.
+                    this.orchestrationBackoffHelper.Reset();
                     workItem.LockedUntilUtc = newLockExpiration;
                     return messages;
                 }

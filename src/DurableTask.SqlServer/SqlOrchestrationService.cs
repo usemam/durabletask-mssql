@@ -371,7 +371,6 @@ namespace DurableTask.SqlServer
                         Session = this.settings.ExtendedSessionsEnabled
                             ? new SqlOrchestrationSession(
                                 this.settings,
-                                this.orchestrationBackoffHelper,
                                 this.traceHelper,
                                 eventPayloadMappings,
                                 orchestrationInstanceId,
