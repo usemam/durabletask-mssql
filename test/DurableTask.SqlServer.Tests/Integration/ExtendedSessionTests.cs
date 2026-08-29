@@ -4,7 +4,9 @@
 namespace DurableTask.SqlServer.Tests.Integration
 {
     using System;
+    using System.Collections.Generic;
     using System.Diagnostics;
+    using System.Linq;
     using System.Threading.Tasks;
     using DurableTask.Core;
     using DurableTask.SqlServer.Tests.Utils;
@@ -149,6 +151,51 @@ namespace DurableTask.SqlServer.Tests.Integration
             await instance.WaitForCompletion(
                 timeout: TimeSpan.FromSeconds(15),
                 expectedOutput: eventCount);
+
+            string lockedBy = await this.GetLockedByAsync(instance.InstanceId);
+            Assert.Equal(string.Empty, lockedBy);
+        }
+
+        [Fact]
+        public async Task EventsDeliveredInOrderAcrossSession()
+        {
+            const int eventCount = 10;
+            TaskCompletionSource<int> tcs = null;
+
+            TestInstance<string> instance = await this.testService.RunOrchestration<string, string>(
+                input: null,
+                orchestrationName: nameof(EventsDeliveredInOrderAcrossSession),
+                implementation: async (ctx, _) =>
+                {
+                    // 'received' is rebuilt from awaited results on every replay, so it stays
+                    // deterministic. Its contents reflect the order events were delivered to the
+                    // orchestrator, which mirrors the order _FetchOrchestrationMessages returned them.
+                    var received = new List<int>();
+                    for (int i = 0; i < eventCount; i++)
+                    {
+                        tcs = new TaskCompletionSource<int>();
+                        received.Add(await tcs.Task);
+                    }
+
+                    return string.Join(",", received);
+                },
+                onEvent: (ctx, name, value) => tcs.TrySetResult(int.Parse(value)));
+
+            await instance.WaitForStart();
+            await this.WaitForLockToBeHeldAsync(instance.InstanceId, TimeSpan.FromSeconds(10));
+
+            // Raise events in a known order. They accumulate in NewEvents and are fetched as a
+            // batch by the extended session; without a deterministic ORDER BY on SequenceNumber
+            // they could be delivered — and therefore observed — out of order.
+            for (int i = 0; i < eventCount; i++)
+            {
+                await instance.RaiseEventAsync("Number", i);
+            }
+
+            string expected = string.Join(",", Enumerable.Range(0, eventCount));
+            await instance.WaitForCompletion(
+                timeout: TimeSpan.FromSeconds(20),
+                expectedOutput: expected);
 
             string lockedBy = await this.GetLockedByAsync(instance.InstanceId);
             Assert.Equal(string.Empty, lockedBy);

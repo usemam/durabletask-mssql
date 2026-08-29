@@ -1425,6 +1425,7 @@ BEGIN
         N.[TaskHub] = @TaskHub AND
         N.[InstanceID] = @InstanceID AND
         (N.[VisibleTime] IS NULL OR N.[VisibleTime] < @now)
+    ORDER BY N.[SequenceNumber] ASC
 END
 GO
 
