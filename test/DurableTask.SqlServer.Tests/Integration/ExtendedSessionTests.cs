@@ -301,6 +301,85 @@ namespace DurableTask.SqlServer.Tests.Integration
                 expectedOutput: "done");
         }
 
+        [Fact]
+        public async Task StaleLeaseOperationsAreRejected()
+        {
+            TaskCompletionSource<string> tcs = null;
+
+            TestInstance<string> instance = await this.testService.RunOrchestration<string, string>(
+                input: null,
+                orchestrationName: nameof(StaleLeaseOperationsAreRejected),
+                implementation: (ctx, _) =>
+                {
+                    tcs = new TaskCompletionSource<string>();
+                    return tcs.Task;
+                },
+                onEvent: (ctx, name, value) => tcs.TrySetResult(JsonConvert.DeserializeObject<string>(value)));
+
+            await instance.WaitForStart();
+            string liveToken = await this.WaitForLockToBeHeldAsync(instance.InstanceId, TimeSpan.FromSeconds(10));
+
+            const string staleToken = "stale-owner-token";
+            const string future = "2999-01-01T00:00:00";
+            string id = instance.InstanceId;
+            string execId = instance.ExecutionId;
+
+            // A stale owner token — e.g. a session whose lease expired and was reacquired by another
+            // acquisition — must be rejected by every lock-guarded stored procedure with error 50003.
+            Assert.Equal(50003, await this.RunGuardedProcAsync(
+                $"EXEC dt._FetchOrchestrationMessages @InstanceID='{id}', @LockedBy='{staleToken}', @LockExpiration='{future}', @BatchSize=10;"));
+
+            Assert.Equal(50003, await this.RunGuardedProcAsync(
+                $"EXEC dt._RenewOrchestrationLocks @InstanceID='{id}', @LockExpiration='{future}', @LockedBy='{staleToken}';"));
+
+            Assert.Equal(50003, await this.RunGuardedProcAsync($@"
+DECLARE @de dt.MessageIDs;
+DECLARE @he dt.HistoryEvents;
+DECLARE @oe dt.OrchestrationEvents;
+DECLARE @te dt.TaskEvents;
+EXEC dt._CheckpointOrchestration
+    @InstanceID='{id}', @ExecutionID='{execId}', @RuntimeStatus='Running',
+    @CustomStatusPayload=NULL, @DeletedEvents=@de, @NewHistoryEvents=@he,
+    @NewOrchestrationEvents=@oe, @NewTaskEvents=@te,
+    @KeepLocked=1, @LockedBy='{staleToken}', @NewLockExpiration='{future}';"));
+
+            // Release with a stale token must not clear the real owner's lock.
+            await this.RunGuardedProcAsync(
+                $"EXEC dt._ReleaseOrchestrationLock @InstanceID='{id}', @LockedBy='{staleToken}';");
+            Assert.Equal(liveToken, await this.GetLockedByAsync(id));
+
+            // The guard is genuine, not always-failing: the real owner can renew its unexpired lease.
+            Assert.Equal(0, await this.RunGuardedProcAsync(
+                $"EXEC dt._RenewOrchestrationLocks @InstanceID='{id}', @LockExpiration='{future}', @LockedBy='{liveToken}';"));
+
+            // Even the correct owner is rejected once the lease has expired.
+            await SharedTestHelpers.ExecuteSqlAsync(
+                this.output,
+                $"UPDATE dt.[Instances] SET [LockExpiration] = DATEADD(MINUTE, -5, SYSUTCDATETIME()) WHERE [InstanceID] = '{id}'");
+            Assert.Equal(50003, await this.RunGuardedProcAsync(
+                $"EXEC dt._RenewOrchestrationLocks @InstanceID='{id}', @LockExpiration='{future}', @LockedBy='{liveToken}';"));
+
+            // The orchestration still drives to completion after the lease is lost: the stale session
+            // aborts and a fresh lock acquisition takes over.
+            await instance.RaiseEventAsync("Continue", "done");
+            await instance.WaitForCompletion(timeout: TimeSpan.FromSeconds(30), expectedOutput: "done");
+        }
+
+        async Task<int> RunGuardedProcAsync(string procBatch)
+        {
+            string sql = $@"
+BEGIN TRY
+    {procBatch}
+    SELECT 0;
+END TRY
+BEGIN CATCH
+    SELECT ERROR_NUMBER();
+END CATCH";
+            object result = await SharedTestHelpers.ExecuteSqlAsync(
+                this.output, sql, this.testService.TestCredentialConnectionString);
+            return Convert.ToInt32(result);
+        }
+
         async Task<string> GetLockedByAsync(string instanceId)
         {
             object result = await SharedTestHelpers.ExecuteSqlAsync(

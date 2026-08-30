@@ -178,8 +178,12 @@ namespace DurableTask.SqlServer
                 int batchSize = this.settings.WorkItemBatchSize;
                 DateTime lockExpiration = DateTime.UtcNow.Add(this.settings.WorkItemLockTimeout);
 
+                string lockOwnershipToken = this.settings.ExtendedSessionsEnabled
+                    ? $"{this.lockedByValue}|{Guid.NewGuid():N}"
+                    : this.lockedByValue;
+
                 command.Parameters.Add("@BatchSize", SqlDbType.Int).Value = batchSize;
-                command.Parameters.Add("@LockedBy", SqlDbType.VarChar, 100).Value = this.lockedByValue;
+                command.Parameters.Add("@LockedBy", SqlDbType.VarChar, 100).Value = lockOwnershipToken;
                 command.Parameters.Add("@LockExpiration", SqlDbType.DateTime2).Value = lockExpiration;
                 if (orchestrationFilterType == OrchestrationFilterType.OrchestrationsOnly)
                 {
@@ -366,6 +370,7 @@ namespace DurableTask.SqlServer
                     {
                         InstanceId = orchestrationInstanceId,
                         LockedUntilUtc = lockExpiration,
+                        LockOwnershipToken = lockOwnershipToken,
                         NewMessages = messages,
                         OrchestrationRuntimeState = runtimeState,
                         Session = this.settings.ExtendedSessionsEnabled
@@ -374,7 +379,7 @@ namespace DurableTask.SqlServer
                                 this.traceHelper,
                                 eventPayloadMappings,
                                 orchestrationInstanceId,
-                                this.lockedByValue,
+                                lockOwnershipToken,
                                 this.ShutdownToken)
                             : null,
                     };
@@ -394,7 +399,21 @@ namespace DurableTask.SqlServer
             command.Parameters.Add("@InstanceID", SqlDbType.VarChar, size: 100).Value = workItem.InstanceId;
             command.Parameters.Add("@LockExpiration", SqlDbType.DateTime2).Value = lockExpiration;
 
-            await SqlUtils.ExecuteNonQueryAsync(command, this.traceHelper, workItem.InstanceId);
+            string? lockOwnershipToken = (workItem as ExtendedOrchestrationWorkItem)?.LockOwnershipToken;
+            if (workItem.Session != null && lockOwnershipToken != null)
+            {
+                command.Parameters.Add("@LockedBy", SqlDbType.VarChar, size: 100).Value = lockOwnershipToken;
+            }
+
+            try
+            {
+                await SqlUtils.ExecuteNonQueryAsync(command, this.traceHelper, workItem.InstanceId);
+            }
+            catch (SqlException e) when (SqlUtils.HasErrorNumber(e, SqlOrchestrationSession.LockLostErrorNumber))
+            {
+                throw new SessionAbortedException(
+                    $"Lost the lock for instance '{workItem.InstanceId}' while renewing.", e);
+            }
 
             workItem.LockedUntilUtc = lockExpiration;
         }
@@ -432,12 +451,17 @@ namespace DurableTask.SqlServer
             command.Parameters.Add("@RuntimeStatus", SqlDbType.VarChar, size: 30).Value = orchestrationState.OrchestrationStatus.ToString();
             command.Parameters.Add("@CustomStatusPayload", SqlDbType.VarChar).Value = orchestrationState.Status ?? SqlString.Null;
 
-            bool keepLocked = workItem.Session != null && !IsTerminalStatus(orchestrationState.OrchestrationStatus);
+            bool hasSession = workItem.Session != null;
+            bool keepLocked = hasSession && !IsTerminalStatus(orchestrationState.OrchestrationStatus);
             DateTime newLockExpiration = DateTime.UtcNow.Add(this.settings.WorkItemLockTimeout);
+            if (hasSession)
+            {
+                command.Parameters.Add("@LockedBy", SqlDbType.VarChar, size: 100).Value = currentWorkItem.LockOwnershipToken;
+            }
+
             if (keepLocked)
             {
                 command.Parameters.Add("@KeepLocked", SqlDbType.Bit).Value = true;
-                command.Parameters.Add("@LockedBy", SqlDbType.VarChar, size: 100).Value = this.lockedByValue;
                 command.Parameters.Add("@NewLockExpiration", SqlDbType.DateTime2).Value = newLockExpiration;
             }
 
@@ -480,7 +504,7 @@ namespace DurableTask.SqlServer
                 this.traceHelper.DuplicateExecutionDetected(instance, orchestrationState.Name);
                 return;
             }
-            catch (SqlException e) when (keepLocked && SqlUtils.HasErrorNumber(e, SqlOrchestrationSession.LockLostErrorNumber))
+            catch (SqlException e) when (hasSession && SqlUtils.HasErrorNumber(e, SqlOrchestrationSession.LockLostErrorNumber))
             {
                 throw new SessionAbortedException(
                     $"Lost the lock for instance '{instance.InstanceId}' during checkpoint.", e);
@@ -1034,6 +1058,8 @@ namespace DurableTask.SqlServer
             public OrchestrationInstance Instance { get; }
 
             public EventPayloadMap EventPayloadMappings { get; }
+
+            public string? LockOwnershipToken { get; set; }
         }
 
         class ExtendedActivityWorkItem : TaskActivityWorkItem

@@ -47,6 +47,11 @@ namespace DurableTask.SqlServer.Tests.Utils
 
         public SqlOrchestrationServiceSettings OrchestrationServiceOptions { get; private set; }
 
+        // The low-privilege connection string used by the worker. Tests that call stored procedures
+        // directly must use this so that dt.CurrentTaskHub() resolves to the same task hub the
+        // orchestration runs under (task hub is inferred from the login when multitenancy is on).
+        public string TestCredentialConnectionString => this.testCredential.ConnectionString;
+
         public Mock<SqlOrchestrationService> OrchestrationServiceMock { get; private set; }
 
         public TestLogProvider LogProvider { get; }

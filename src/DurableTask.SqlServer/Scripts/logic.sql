@@ -888,21 +888,16 @@ BEGIN
     WHERE
         [TaskHub] = @TaskHub
         AND [InstanceID] = @InstanceID
-        -- Do not overwrite a row that was taken over by a different worker after our lock expired.
-        AND (@KeepLocked = 0 OR [LockedBy] = @LockedBy)
+        -- When a lock owner is supplied (extended sessions), only write if we still own an unexpired lease.
+        AND (@LockedBy IS NULL OR ([LockedBy] = @LockedBy AND [LockExpiration] IS NOT NULL AND [LockExpiration] > SYSUTCDATETIME()))
 
     IF @@ROWCOUNT = 0
     BEGIN
-        IF @KeepLocked = 1
-        BEGIN
-            ROLLBACK TRANSACTION;
+        ROLLBACK TRANSACTION;
+        IF @LockedBy IS NOT NULL
             THROW 50003, 'Lock lost.', 1;
-        END
         ELSE
-        BEGIN
-            ROLLBACK TRANSACTION;
             THROW 50000, 'The instance does not exist.', 1;
-        END
     END
     -- External event messages can create new instances
     -- NOTE: There is a chance this could result in deadlocks if two 
@@ -1348,14 +1343,23 @@ GO
 
 CREATE OR ALTER PROCEDURE __SchemaNamePlaceholder__._RenewOrchestrationLocks
     @InstanceID varchar(100),
-    @LockExpiration datetime2
+    @LockExpiration datetime2,
+    @LockedBy varchar(100) = NULL
 AS
 BEGIN
     DECLARE @TaskHub varchar(50) = __SchemaNamePlaceholder__.CurrentTaskHub()
 
     UPDATE Instances
     SET [LockExpiration] = @LockExpiration
-    WHERE [TaskHub] = @TaskHub AND [InstanceID] = @InstanceID
+    WHERE
+        [TaskHub] = @TaskHub
+        AND [InstanceID] = @InstanceID
+        -- When a lock owner is supplied (extended sessions), only renew a lease we still own and
+        -- that has not yet expired. This prevents a stale session from resurrecting a lost lease.
+        AND (@LockedBy IS NULL OR ([LockedBy] = @LockedBy AND [LockExpiration] IS NOT NULL AND [LockExpiration] > SYSUTCDATETIME()))
+
+    IF @LockedBy IS NOT NULL AND @@ROWCOUNT = 0
+        THROW 50003, 'Lock lost.', 1;
 END
 GO
 
