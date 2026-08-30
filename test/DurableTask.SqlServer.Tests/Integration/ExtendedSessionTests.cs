@@ -88,6 +88,37 @@ namespace DurableTask.SqlServer.Tests.Integration
         }
 
         [Fact]
+        public async Task LockReleasedOnWorkerShutdown()
+        {
+            // Use a long idle timeout so the idle-timeout path cannot be what clears the lock —
+            // any release must be attributable to the worker shutting down.
+            this.testService.OrchestrationServiceOptions.ExtendedSessionIdleTimeout = TimeSpan.FromMinutes(5);
+
+            TaskCompletionSource<string> tcs = null;
+
+            TestInstance<string> instance = await this.testService.RunOrchestration<string, string>(
+                input: null,
+                orchestrationName: nameof(LockReleasedOnWorkerShutdown),
+                implementation: (ctx, _) =>
+                {
+                    tcs = new TaskCompletionSource<string>();
+                    return tcs.Task;
+                },
+                onEvent: (ctx, name, value) => tcs.TrySetResult(JsonConvert.DeserializeObject<string>(value)));
+
+            await instance.WaitForStart();
+            await this.WaitForLockToBeHeldAsync(instance.InstanceId, TimeSpan.FromSeconds(10));
+
+            // Gracefully drain the worker while the session is still holding the lock. This must not
+            // throw, and the session must unwind so the lock no longer dangles.
+            Exception shutdownException = await Record.ExceptionAsync(
+                () => this.testService.StopWorkerAsync(isForced: false));
+            Assert.Null(shutdownException);
+
+            await this.WaitForLockToBeReleasedAsync(instance.InstanceId, TimeSpan.FromSeconds(30));
+        }
+
+        [Fact]
         public async Task LockNotPoachedWhileSessionActive()
         {
             TaskCompletionSource<string> tcs = null;

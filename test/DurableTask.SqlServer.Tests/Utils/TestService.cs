@@ -110,6 +110,8 @@ namespace DurableTask.SqlServer.Tests.Utils
 
         public Task StartWorkerAsync() => this.worker?.StartAsync() ?? Task.CompletedTask;
 
+        public Task StopWorkerAsync(bool isForced = false) => this.worker?.StopAsync(isForced) ?? Task.CompletedTask;
+
         public void AddActivityDispatcherMiddleware(Func<DispatchMiddlewareContext, Func<Task>, Task> middleware)
         {
             this.worker.AddActivityDispatcherMiddleware(middleware);
