@@ -491,6 +491,11 @@ namespace DurableTask.SqlServer
                 workItem.LockedUntilUtc = newLockExpiration;
             }
 
+            if (workItem.Session != null)
+            {
+                currentWorkItem.EventPayloadMappings.Clear();
+            }
+
             // notify pollers that new messages may be available
             if (outboundMessages.Count > 0)
             {

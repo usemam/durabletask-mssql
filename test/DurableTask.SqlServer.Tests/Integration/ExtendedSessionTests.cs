@@ -225,6 +225,54 @@ namespace DurableTask.SqlServer.Tests.Integration
         }
 
         [Fact]
+        public async Task ContinueAsNewWithScheduledWorkAcrossSession()
+        {
+            const int generations = 3;
+
+            // The activity (task ID 0) and sub-orchestration (task ID 1) are re-scheduled in every
+            // generation, so their IDs restart after each ContinueAsNew. In a retained session the
+            // EventPayloadMap is reused across generations, so without clearing it after each
+            // checkpoint the second generation's task ID 0 would collide with the first generation's
+            // key and throw before the checkpoint.
+            this.testService.RegisterInlineActivity(
+                "CanEcho", string.Empty, TestService.MakeActivity<int, int>((ctx, input) => input));
+            this.testService.RegisterInlineOrchestration<int, int>(
+                "CanChild", string.Empty, implementation: (ctx, input) => Task.FromResult(input));
+
+            TestInstance<int> instance = await this.testService.RunOrchestration(
+                input: 0,
+                orchestrationName: nameof(ContinueAsNewWithScheduledWorkAcrossSession),
+                implementation: async (ctx, input) =>
+                {
+                    int fromActivity = await ctx.ScheduleTask<int>("CanEcho", string.Empty, input);
+                    int fromChild = await ctx.CreateSubOrchestrationInstance<int>("CanChild", string.Empty, input);
+
+                    if (input < generations)
+                    {
+                        ctx.ContinueAsNew(input + 1);
+                    }
+
+                    return fromActivity + fromChild;
+                });
+
+            await instance.WaitForCompletion(
+                timeout: TimeSpan.FromSeconds(30),
+                expectedOutput: generations * 2,
+                continuedAsNew: true);
+
+            string lockedBy = await this.GetLockedByAsync(instance.InstanceId);
+            Assert.Equal(string.Empty, lockedBy);
+
+            // The orchestration self-heals from a payload-map collision by aborting and re-locking
+            // with a fresh map, so completion alone does not prove correctness. Assert the checkpoint
+            // never threw the collision (which the dispatcher logs against the DurableTask.Core category).
+            this.testService.LogProvider.TryGetLogs("DurableTask.Core", out var coreLogs);
+            Assert.DoesNotContain(
+                coreLogs,
+                entry => entry.Exception != null && entry.Exception.ToString().Contains("EventPayloadMap"));
+        }
+
+        [Fact]
         public async Task LockLostRecovers()
         {
             TaskCompletionSource<string> tcs = null;
