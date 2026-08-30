@@ -85,11 +85,8 @@ namespace DurableTask.SqlServer.AzureFunctions
             settings.MaxEntityOperationBatchSize = extensionOptions.MaxEntityOperationBatchSize;
 
             settings.ExtendedSessionsEnabled = extensionOptions.ExtendedSessionsEnabled;
-            if (extensionOptions.ExtendedSessionIdleTimeoutInSeconds > 0)
-            {
-                settings.ExtendedSessionIdleTimeout =
-                    TimeSpan.FromSeconds(extensionOptions.ExtendedSessionIdleTimeoutInSeconds);
-            }
+            settings.ExtendedSessionIdleTimeout = TimeSpan.FromSeconds(
+                Math.Max(0, extensionOptions.ExtendedSessionIdleTimeoutInSeconds));
 
             return settings;
         }
