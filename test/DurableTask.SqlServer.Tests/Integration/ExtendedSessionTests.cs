@@ -444,9 +444,10 @@ namespace DurableTask.SqlServer.Tests.Integration
                 {
                     // Two events keep the instance running (and its lock kept) after the first one.
                     tcs = new TaskCompletionSource<string>();
-                    await tcs.Task;
+                    string first = await tcs.Task;
                     tcs = new TaskCompletionSource<string>();
-                    return await tcs.Task;
+                    string second = await tcs.Task;
+                    return $"{first},{second}";
                 },
                 onEvent: (ctx, name, value) => tcs.TrySetResult(JsonConvert.DeserializeObject<string>(value)));
 
@@ -469,11 +470,11 @@ namespace DurableTask.SqlServer.Tests.Integration
                 entry => entry.Message != null &&
                     entry.Message.Contains($"Checkpoint for instance '{instance.InstanceId}' was rejected as a duplicate execution."));
 
-            // Completing requires "First" to survive the rolled-back checkpoint and be replayed.
+            // "1,2" requires "First" to survive the rolled-back checkpoint and be replayed exactly once.
             await instance.RaiseEventAsync("Second", "2");
             await instance.WaitForCompletion(
                 timeout: TimeSpan.FromSeconds(20),
-                expectedOutput: "2");
+                expectedOutput: "1,2");
         }
 
         [Fact]
