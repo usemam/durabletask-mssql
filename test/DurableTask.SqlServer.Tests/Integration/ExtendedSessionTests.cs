@@ -455,12 +455,7 @@ namespace DurableTask.SqlServer.Tests.Integration
 
             // Occupy the history slot the session's next checkpoint will write, as a concurrent
             // execution would, so that checkpoint fails with a primary key violation.
-            await SharedTestHelpers.ExecuteSqlAsync(
-                this.output,
-                $@"INSERT INTO dt.[History] ([TaskHub], [InstanceID], [ExecutionID], [SequenceNumber], [EventType])
-                   SELECT TOP 1 [TaskHub], [InstanceID], [ExecutionID], [SequenceNumber] + 1, 'GenericEvent'
-                   FROM dt.[History] WHERE [InstanceID] = '{instance.InstanceId}'
-                   ORDER BY [SequenceNumber] DESC");
+            await SharedTestHelpers.OccupyNextHistorySlotAsync(this.output, instance.InstanceId);
 
             await instance.RaiseEventAsync("First", "1");
 
@@ -473,6 +468,12 @@ namespace DurableTask.SqlServer.Tests.Integration
                 coreLogs,
                 entry => entry.Message != null &&
                     entry.Message.Contains($"Checkpoint for instance '{instance.InstanceId}' was rejected as a duplicate execution."));
+
+            // Completing requires "First" to survive the rolled-back checkpoint and be replayed.
+            await instance.RaiseEventAsync("Second", "2");
+            await instance.WaitForCompletion(
+                timeout: TimeSpan.FromSeconds(20),
+                expectedOutput: "2");
         }
 
         [Fact]
